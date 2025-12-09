@@ -35,7 +35,9 @@ fn main() {
 
     // 将程序写入内存
     for (i, &instr) in program.iter().enumerate() {
-        mem.store32((i * 4) as u32, instr);
+        mem
+            .store32((i * 4) as u32, instr)
+            .expect("failed to write demo program into memory");
     }
 
     println!("程序已加载到内存，计算 1 + 2 + ... + 10");
@@ -125,7 +127,9 @@ fn demo_fibonacci() {
 
     // 将程序写入内存
     for (i, &instr) in program.iter().enumerate() {
-        mem.store32((i * 4) as u32, instr);
+        mem
+            .store32((i * 4) as u32, instr)
+            .expect("failed to write fibonacci program into memory");
     }
 
     let mut cpu = CpuCore::new(0);

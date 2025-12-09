@@ -1,4 +1,4 @@
-use super::super::CpuCore;
+use super::super::{CpuCore, MemAccessType};
 use super::super::trap::TrapCause;
 use crate::isa::RvInstr;
 use crate::memory::Memory;
@@ -96,27 +96,42 @@ pub fn execute(cpu: &mut CpuCore, mem: &mut dyn Memory, instr: RvInstr, current_
         // ========== Load 指令 ==========
         RvInstr::Lb { rd, rs1, offset } => {
             let addr = cpu.read_reg(rs1).wrapping_add(offset as u32);
-            let value = mem.load8(addr) as i8 as i32 as u32;
+            let value = match cpu.mem_result(mem.load8(addr), MemAccessType::Load, current_pc) {
+                Some(v) => v as i8 as i32 as u32,
+                None => return true,
+            };
             cpu.write_reg(rd, value);
         }
         RvInstr::Lh { rd, rs1, offset } => {
             let addr = cpu.read_reg(rs1).wrapping_add(offset as u32);
-            let value = mem.load16(addr) as i16 as i32 as u32;
+            let value = match load_halfword(cpu, mem, addr, true, current_pc) {
+                Some(v) => v,
+                None => return true,
+            };
             cpu.write_reg(rd, value);
         }
         RvInstr::Lw { rd, rs1, offset } => {
             let addr = cpu.read_reg(rs1).wrapping_add(offset as u32);
-            let value = mem.load32(addr);
+            let value = match load_word(cpu, mem, addr, current_pc) {
+                Some(v) => v,
+                None => return true,
+            };
             cpu.write_reg(rd, value);
         }
         RvInstr::Lbu { rd, rs1, offset } => {
             let addr = cpu.read_reg(rs1).wrapping_add(offset as u32);
-            let value = mem.load8(addr) as u32;
+            let value = match cpu.mem_result(mem.load8(addr), MemAccessType::Load, current_pc) {
+                Some(v) => v as u32,
+                None => return true,
+            };
             cpu.write_reg(rd, value);
         }
         RvInstr::Lhu { rd, rs1, offset } => {
             let addr = cpu.read_reg(rs1).wrapping_add(offset as u32);
-            let value = mem.load16(addr) as u32;
+            let value = match load_halfword(cpu, mem, addr, false, current_pc) {
+                Some(v) => v,
+                None => return true,
+            };
             cpu.write_reg(rd, value);
         }
 
@@ -124,17 +139,23 @@ pub fn execute(cpu: &mut CpuCore, mem: &mut dyn Memory, instr: RvInstr, current_
         RvInstr::Sb { rs1, rs2, offset } => {
             let addr = cpu.read_reg(rs1).wrapping_add(offset as u32);
             let value = cpu.read_reg(rs2) as u8;
-            mem.store8(addr, value);
+            if !cpu.mem_result_unit(mem.store8(addr, value), MemAccessType::Store, current_pc) {
+                return true;
+            }
         }
         RvInstr::Sh { rs1, rs2, offset } => {
             let addr = cpu.read_reg(rs1).wrapping_add(offset as u32);
             let value = cpu.read_reg(rs2) as u16;
-            mem.store16(addr, value);
+            if !store_halfword(cpu, mem, addr, value, current_pc) {
+                return true;
+            }
         }
         RvInstr::Sw { rs1, rs2, offset } => {
             let addr = cpu.read_reg(rs1).wrapping_add(offset as u32);
             let value = cpu.read_reg(rs2);
-            mem.store32(addr, value);
+            if !store_word(cpu, mem, addr, value, current_pc) {
+                return true;
+            }
         }
 
         // ========== U-type 指令 ==========
@@ -209,5 +230,93 @@ pub fn execute(cpu: &mut CpuCore, mem: &mut dyn Memory, instr: RvInstr, current_
         _ => return false,
     }
 
+    true
+}
+
+fn load_halfword(
+    cpu: &mut CpuCore,
+    mem: &mut dyn Memory,
+    addr: u32,
+    signed: bool,
+    current_pc: u32,
+) -> Option<u32> {
+    if addr & 0x1 == 0 {
+        let raw = cpu.mem_result(mem.load16(addr), MemAccessType::Load, current_pc)?;
+        return Some(if signed { raw as i16 as i32 as u32 } else { raw as u32 });
+    }
+
+    let b0 = cpu.mem_result(mem.load8(addr), MemAccessType::Load, current_pc)?;
+    let b1 = cpu.mem_result(mem.load8(addr.wrapping_add(1)), MemAccessType::Load, current_pc)?;
+    let raw = u16::from_le_bytes([b0, b1]);
+    Some(if signed { raw as i16 as i32 as u32 } else { raw as u32 })
+}
+
+fn load_word(
+    cpu: &mut CpuCore,
+    mem: &mut dyn Memory,
+    addr: u32,
+    current_pc: u32,
+) -> Option<u32> {
+    if addr & 0x3 == 0 {
+        return cpu.mem_result(mem.load32(addr), MemAccessType::Load, current_pc);
+    }
+
+    let mut bytes = [0u8; 4];
+    for i in 0..4 {
+        bytes[i] = cpu.mem_result(
+            mem.load8(addr.wrapping_add(i as u32)),
+            MemAccessType::Load,
+            current_pc,
+        )?;
+    }
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn store_halfword(
+    cpu: &mut CpuCore,
+    mem: &mut dyn Memory,
+    addr: u32,
+    value: u16,
+    current_pc: u32,
+) -> bool {
+    if addr & 0x1 == 0 {
+        return cpu.mem_result_unit(mem.store16(addr, value), MemAccessType::Store, current_pc);
+    }
+
+    let bytes = value.to_le_bytes();
+    if !cpu.mem_result_unit(mem.store8(addr, bytes[0]), MemAccessType::Store, current_pc) {
+        return false;
+    }
+    if !cpu.mem_result_unit(
+        mem.store8(addr.wrapping_add(1), bytes[1]),
+        MemAccessType::Store,
+        current_pc,
+    ) {
+        return false;
+    }
+    true
+}
+
+fn store_word(
+    cpu: &mut CpuCore,
+    mem: &mut dyn Memory,
+    addr: u32,
+    value: u32,
+    current_pc: u32,
+) -> bool {
+    if addr & 0x3 == 0 {
+        return cpu.mem_result_unit(mem.store32(addr, value), MemAccessType::Store, current_pc);
+    }
+
+    let bytes = value.to_le_bytes();
+    for i in 0..4 {
+        if !cpu.mem_result_unit(
+            mem.store8(addr.wrapping_add(i as u32), bytes[i]),
+            MemAccessType::Store,
+            current_pc,
+        ) {
+            return false;
+        }
+    }
     true
 }

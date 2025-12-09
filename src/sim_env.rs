@@ -29,7 +29,7 @@ use elf::endian::AnyEndian;
 use elf::ElfBytes;
 
 use crate::cpu::{CpuCore, CpuBuilder, CpuState};
-use crate::memory::FlatMemory;
+use crate::memory::{FlatMemory, Memory, MemError};
 
 /// 仿真配置错误
 #[derive(Debug)]
@@ -63,6 +63,12 @@ impl std::error::Error for SimError {}
 impl From<io::Error> for SimError {
     fn from(e: io::Error) -> Self {
         SimError::Io(e)
+    }
+}
+
+impl From<MemError> for SimError {
+    fn from(e: MemError) -> Self {
+        SimError::Memory(e.to_string())
     }
 }
 
@@ -475,6 +481,67 @@ impl ElfInfo {
     }
 }
 
+fn len_to_u32(len: usize) -> Result<u32, SimError> {
+    len.try_into().map_err(|_| SimError::Memory(format!("Size {} exceeds 32-bit address space", len)))
+}
+
+fn range_end(addr: u32, len: usize) -> Result<u32, SimError> {
+    let len_u32 = len_to_u32(len)?;
+    addr.checked_add(len_u32).ok_or_else(|| {
+        SimError::Memory(format!("Address range overflow: start=0x{:08x}, len=0x{:x}", addr, len))
+    })
+}
+
+fn ensure_range(region: &MemoryRegion, addr: u32, len: usize) -> Result<(), SimError> {
+    let region_end = range_end(region.base, region.size)?;
+    let target_end = range_end(addr, len)?;
+    if addr < region.base || target_end > region_end {
+        return Err(SimError::Memory(format!(
+            "Memory region '{}' (0x{:08x}..0x{:08x}) cannot fit range 0x{:08x}..0x{:08x}",
+            region.name,
+            region.base,
+            region_end,
+            addr,
+            target_end,
+        )));
+    }
+    Ok(())
+}
+
+fn load_segments_into_memory(
+    memory: &mut FlatMemory,
+    region: &MemoryRegion,
+    segments: &[ElfSegment],
+) -> Result<(), SimError> {
+    for (i, seg) in segments.iter().enumerate() {
+        ensure_range(region, seg.vaddr, seg.mem_size)?;
+        if seg.mem_size == 0 {
+            continue;
+        }
+
+        memory
+            .write_bytes(seg.vaddr, &seg.data)
+            .map_err(SimError::from)?;
+
+        if seg.mem_size > seg.file_size {
+            let bss_start = range_end(seg.vaddr, seg.file_size)?;
+            let bss_size = seg.mem_size - seg.file_size;
+            memory.fill(bss_start, bss_size, 0).map_err(SimError::from)?;
+        }
+
+        if cfg!(debug_assertions) {
+            let end = range_end(seg.vaddr, seg.mem_size)?;
+            if end <= seg.vaddr {
+                return Err(SimError::Memory(format!(
+                    "Segment {} has invalid range (wraparound)",
+                    i
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// ISA 测试结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestResult {
@@ -550,9 +617,8 @@ impl SimEnv {
                 }
             }
 
-            // 加载所有段到内存
-            for (i, seg) in elf.segments.iter().enumerate() {
-                if config.verbose {
+            if config.verbose {
+                for (i, seg) in elf.segments.iter().enumerate() {
                     println!(
                         "  Segment {}: vaddr=0x{:08x}, size=0x{:x}, flags={}{}",
                         i,
@@ -562,18 +628,9 @@ impl SimEnv {
                         if seg.writable { "W" } else { "R" },
                     );
                 }
-                
-                // 写入段数据
-                memory.write_bytes(seg.vaddr, &seg.data);
-                
-                // 如果 mem_size > file_size，用零填充 BSS 区域
-                if seg.mem_size > seg.file_size {
-                    let bss_start = seg.vaddr + seg.file_size as u32;
-                    let bss_size = seg.mem_size - seg.file_size;
-                    let zeros = vec![0u8; bss_size];
-                    memory.write_bytes(bss_start, &zeros);
-                }
             }
+
+            load_segments_into_memory(&mut memory, &config.memory, &elf.segments)?;
 
             // 使用 ELF 入口点（除非配置明确指定了入口）
             if config.entry_pc.is_none() {
@@ -582,6 +639,7 @@ impl SimEnv {
         } else if let Some(ref bin_path) = config.bin_path {
             // 加载原始二进制文件
             let data = std::fs::read(bin_path)?;
+            ensure_range(&config.memory, config.bin_load_addr, data.len())?;
             
             if config.verbose {
                 println!("Loaded binary: {}", bin_path);
@@ -589,7 +647,9 @@ impl SimEnv {
                 println!("  Size: {} bytes", data.len());
             }
 
-            memory.write_bytes(config.bin_load_addr, &data);
+            memory
+                .write_bytes(config.bin_load_addr, &data)
+                .map_err(SimError::from)?;
 
             // 使用二进制加载地址作为入口点
             if config.entry_pc.is_none() {
@@ -604,14 +664,18 @@ impl SimEnv {
             println!("CPU initialized at PC=0x{:08x}", entry_pc);
         }
 
-        Ok(SimEnv {
+        let mut env = SimEnv {
             cpu,
             memory,
             config,
             instructions_executed: 0,
             tohost_addr,
             fromhost_addr,
-        })
+        };
+
+        env.clear_htif_mailboxes();
+
+        Ok(env)
     }
 
     /// 根据扩展配置构建 CPU
@@ -721,18 +785,35 @@ impl SimEnv {
         self.cpu.dump_regs();
     }
 
-    /// 检查 tohost 值
-    ///
-    /// 返回 Some(value) 如果 tohost 被写入非零值
-    pub fn check_tohost(&self) -> Option<u32> {
-        use crate::memory::Memory;
+    /// 检查 tohost 值并在检测到写入时执行 ACK
+    pub fn check_tohost(&mut self) -> Option<u32> {
         if let Some(addr) = self.tohost_addr {
-            let value = self.memory.load32(addr);
-            if value != 0 {
-                return Some(value);
+            if let Ok(value) = self.memory.load32(addr) {
+                if value != 0 {
+                    self.acknowledge_tohost(value);
+                    return Some(value);
+                }
             }
         }
         None
+    }
+
+    fn clear_htif_mailboxes(&mut self) {
+        if let Some(addr) = self.tohost_addr {
+            let _ = self.memory.store32(addr, 0);
+        }
+        if let Some(addr) = self.fromhost_addr {
+            let _ = self.memory.store32(addr, 0);
+        }
+    }
+
+    fn acknowledge_tohost(&mut self, value: u32) {
+        if let Some(addr) = self.tohost_addr {
+            let _ = self.memory.store32(addr, 0);
+        }
+        if let Some(addr) = self.fromhost_addr {
+            let _ = self.memory.store32(addr, value);
+        }
     }
 
     /// 运行 ISA 测试
@@ -756,24 +837,31 @@ impl SimEnv {
 
         // 如果没有 tohost 地址，直接运行到停止
         if self.tohost_addr.is_none() {
+            let start = self.instructions_executed;
             let (executed, _state) = self.run(max);
-            return (TestResult::Timeout, executed);
+            let delta = self.instructions_executed - start;
+            let reported = if delta == 0 { executed } else { delta };
+            return (TestResult::Timeout, reported);
         }
 
-        // 逐步执行，检查 tohost
+        self.clear_htif_mailboxes();
+        let start = self.instructions_executed;
+
         for _ in 0..max {
             let state = self.step();
             
             // 检查 tohost
             if let Some(value) = self.check_tohost() {
-                return (TestResult::from_tohost(value), self.instructions_executed);
+                let delta = self.instructions_executed - start;
+                return (TestResult::from_tohost(value), delta);
             }
             
             // 检查 CPU 状态（非法指令等）
             if state != CpuState::Running {
                 // 可能是 trap，继续检查 tohost
                 if let Some(value) = self.check_tohost() {
-                    return (TestResult::from_tohost(value), self.instructions_executed);
+                    let delta = self.instructions_executed - start;
+                    return (TestResult::from_tohost(value), delta);
                 }
                 // CPU 停止但 tohost 未写入
                 break;
@@ -781,7 +869,8 @@ impl SimEnv {
         }
 
         // 超时或 CPU 异常停止
-        (TestResult::Timeout, self.instructions_executed)
+        let delta = self.instructions_executed - start;
+        (TestResult::Timeout, delta)
     }
 
     /// 重置仿真环境
@@ -794,20 +883,25 @@ impl SimEnv {
         // 如果有 ELF，重新加载
         if let Some(ref elf_path) = self.config.elf_path {
             let elf = ElfInfo::parse(elf_path)?;
-            for seg in &elf.segments {
-                self.memory.write_bytes(seg.vaddr, &seg.data);
-                if seg.mem_size > seg.file_size {
-                    let bss_start = seg.vaddr + seg.file_size as u32;
-                    let bss_size = seg.mem_size - seg.file_size;
-                    let zeros = vec![0u8; bss_size];
-                    self.memory.write_bytes(bss_start, &zeros);
-                }
-            }
+            self.tohost_addr = elf.find_symbol("tohost");
+            self.fromhost_addr = elf.find_symbol("fromhost");
+            load_segments_into_memory(&mut self.memory, &self.config.memory, &elf.segments)?;
             // 设置入口点
             if self.config.entry_pc.is_none() {
                 self.cpu.set_pc(elf.entry);
             }
+        } else if let Some(ref bin_path) = self.config.bin_path {
+            let data = std::fs::read(bin_path)?;
+            ensure_range(&self.config.memory, self.config.bin_load_addr, data.len())?;
+            self.memory
+                .write_bytes(self.config.bin_load_addr, &data)
+                .map_err(SimError::from)?;
+            if self.config.entry_pc.is_none() {
+                self.cpu.set_pc(self.config.bin_load_addr);
+            }
         }
+
+        self.clear_htif_mailboxes();
 
         Ok(())
     }
@@ -860,7 +954,10 @@ mod tests {
         let mut env = SimEnv::from_config(config).expect("Failed to create sim env");
 
         // 写入简单程序: addi x1, x0, 42
-        env.memory.store32(0, 0x02A00093);
+        env
+            .memory
+            .store32(0, 0x02A00093)
+            .expect("failed to write test instruction");
 
         // 执行一步
         let state = env.step();
@@ -956,7 +1053,10 @@ mod tests {
         // 打印 tohost 值
         if let Some(addr) = env.tohost_addr {
             use crate::memory::Memory;
-            println!("tohost value: 0x{:08x}", env.memory.load32(addr));
+            match env.memory.load32(addr) {
+                Ok(value) => println!("tohost value: 0x{:08x}", value),
+                Err(err) => println!("tohost read error: {err}"),
+            }
         }
         
         match result {

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::isa::{self, DecodedInstr, RvInstr, DecoderRegistry};
-use crate::memory::Memory;
+use crate::memory::{Memory, MemError};
 
 mod exu;
 pub mod csr_def;
@@ -51,6 +51,14 @@ pub struct CpuCore {
     state: CpuState,
     /// 指令解码器
     decoder: Arc<DecoderRegistry>,
+}
+
+/// 内存访问类别（用于生成对应的 trap）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemAccessType {
+    Fetch,
+    Load,
+    Store,
 }
 
 impl CpuCore {
@@ -138,13 +146,48 @@ impl CpuCore {
         self.status.fp.is_some()
     }
 
+    // CSR 地址常量 (浮点 CSR)
+    const CSR_FFLAGS: u16 = 0x001;
+    const CSR_FRM: u16 = 0x002;
+    const CSR_FCSR: u16 = 0x003;
+
     /// CSR 值，如果未注册则返回 0
+    /// 对 FCSR/FFLAGS/FRM 进行关联处理
     pub fn csr_read(&self, csr: u16) -> u32 {
-        self.status.csr_read(csr)
+        match csr {
+            Self::CSR_FFLAGS => {
+                // FFLAGS = FCSR[4:0]
+                self.status.csr_read(Self::CSR_FCSR) & 0x1F
+            }
+            Self::CSR_FRM => {
+                // FRM = FCSR[7:5]
+                (self.status.csr_read(Self::CSR_FCSR) >> 5) & 0x7
+            }
+            _ => self.status.csr_read(csr),
+        }
     }
 
+    /// CSR 写入，对 FCSR/FFLAGS/FRM 进行关联处理
     pub fn csr_write(&mut self, csr: u16, value: u32) {
-        self.status.csr_write(csr, value)
+        match csr {
+            Self::CSR_FFLAGS => {
+                // 写 FFLAGS 只更新 FCSR[4:0]
+                let old_fcsr = self.status.csr_read(Self::CSR_FCSR);
+                let new_fcsr = (old_fcsr & !0x1F) | (value & 0x1F);
+                self.status.csr_write(Self::CSR_FCSR, new_fcsr);
+            }
+            Self::CSR_FRM => {
+                // 写 FRM 只更新 FCSR[7:5]
+                let old_fcsr = self.status.csr_read(Self::CSR_FCSR);
+                let new_fcsr = (old_fcsr & !0xE0) | ((value & 0x7) << 5);
+                self.status.csr_write(Self::CSR_FCSR, new_fcsr);
+            }
+            Self::CSR_FCSR => {
+                // FCSR 只有低 8 位有效
+                self.status.csr_write(csr, value & 0xFF);
+            }
+            _ => self.status.csr_write(csr, value),
+        }
     }
 
    
@@ -159,6 +202,61 @@ impl CpuCore {
     /// 设置 CPU 状态
     pub fn set_state(&mut self, state: CpuState) {
         self.state = state;
+    }
+
+    pub fn handle_memory_error(&mut self, err: MemError, access: MemAccessType, fault_pc: u32) {
+        use MemAccessType::*;
+        use TrapCause::*;
+
+        let (addr, cause) = match err {
+            MemError::Unaligned { addr, .. } => (
+                addr,
+                match access {
+                    Fetch => InstructionAddressMisaligned,
+                    Load => LoadAddressMisaligned,
+                    Store => StoreAddressMisaligned,
+                },
+            ),
+            MemError::OutOfRange { addr, .. } => (
+                addr,
+                match access {
+                    Fetch => InstructionAccessFault,
+                    Load => LoadAccessFault,
+                    Store => StoreAccessFault,
+                },
+            ),
+        };
+
+        self.take_trap_at(cause, addr, fault_pc);
+    }
+
+    pub fn mem_result<T>(
+        &mut self,
+        result: Result<T, MemError>,
+        access: MemAccessType,
+        fault_pc: u32,
+    ) -> Option<T> {
+        match result {
+            Ok(v) => Some(v),
+            Err(err) => {
+                self.handle_memory_error(err, access, fault_pc);
+                None
+            }
+        }
+    }
+
+    pub fn mem_result_unit(
+        &mut self,
+        result: Result<(), MemError>,
+        access: MemAccessType,
+        fault_pc: u32,
+    ) -> bool {
+        if let Err(err) = result {
+            self.handle_memory_error(err, access, fault_pc);
+            false
+        } else {
+            true
+        }
     }
 
     /// 触发 trap（异常或中断）
@@ -267,13 +365,20 @@ impl CpuCore {
             return self.state;
         }
 
-        // 取指
-        let instr_word = mem.load32(self.pc);
-        // 使用配置的解码器解码
-        let decoded = self.decoder.decode(instr_word);
-
         // 保存当前 PC（用于计算返回地址等）
         let current_pc = self.pc;
+
+        // 取指
+        let instr_word = match mem.load32(current_pc) {
+            Ok(word) => word,
+            Err(err) => {
+                self.handle_memory_error(err, MemAccessType::Fetch, current_pc);
+                return self.state;
+            }
+        };
+
+        // 使用配置的解码器解码
+        let decoded = self.decoder.decode(instr_word);
 
         // 默认顺序执行
         self.pc = self.pc.wrapping_add(4);
@@ -324,7 +429,7 @@ impl CpuCore {
             return;
         }
 
-        if exu::rv32f::execute(self, mem, instr) {
+        if exu::rv32f::execute(self, mem, instr, current_pc) {
             return;
         }
 
@@ -389,19 +494,6 @@ impl CpuCore {
                 if i % 4 == 0 {
                     print!("  ");
                 }
-                let bits = fp.read(i as u8);
-                let f = f32::from_bits(bits);
-                print!("f{:02}: {:12.6} ", i, f);
-                if i % 4 == 3 {
-                    println!();
-                }
-            }
-            // 再打印一遍十六进制形式
-            println!("  (hex):");
-            for i in 0..32 {
-                if i % 4 == 0 {
-                    print!("  ");
-                }
                 print!("f{:02}: 0x{:08x}  ", i, fp.read(i as u8));
                 if i % 4 == 3 {
                     println!();
@@ -428,11 +520,18 @@ impl CpuCore {
         if !csr_snapshot.is_empty() {
             println!();
             println!("─── Control and Status Registers (CSR) ───────────────────────────");
-            let mut csr_list: Vec<_> = csr_snapshot.iter().collect();
+            let mut csr_list: Vec<_> = csr_snapshot
+                .iter()
+                .map(|(&addr, &value)| (addr, value))
+                .collect();
             csr_list.sort_by_key(|(addr, _)| *addr);
             
-            for (i, (addr, value)) in csr_list.iter().enumerate() {
-                print!("  0x{:03x}: 0x{:08x}", addr, value);
+            for (i, &(addr, value)) in csr_list.iter().enumerate() {
+                if let Some(name) = csr_name(addr) {
+                    print!("  {:>12}: 0x{:08x}", name, value);
+                } else {
+                    print!("  0x{:03x}: 0x{:08x}", addr, value);
+                }
                 if i % 3 == 2 {
                     println!();
                 } else {
@@ -455,6 +554,18 @@ impl Default for CpuCore {
     }
 }
 
+fn csr_name(addr: u16) -> Option<&'static str> {
+    fn find(slice: &[CsrEntry], addr: u16) -> Option<&'static str> {
+        slice.iter().find(|entry| entry.addr == addr).map(|entry| entry.name)
+    }
+
+    find(crate::cpu::csr_def::BASE_CSRS, addr)
+        .or_else(|| find(crate::cpu::csr_def::F_CSRS, addr))
+        .or_else(|| find(crate::cpu::csr_def::V_CSRS, addr))
+        .or_else(|| find(crate::cpu::csr_def::M_CSRS, addr))
+        .or_else(|| find(crate::cpu::csr_def::S_CSRS, addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,7 +573,7 @@ mod tests {
 
     /// 将指令写入内存
     fn write_instr(mem: &mut FlatMemory, addr: u32, instr: u32) {
-        mem.store32(addr, instr);
+        mem.store32(addr, instr).unwrap();
     }
 
     #[test]
@@ -533,7 +644,7 @@ mod tests {
         cpu.run(&mut mem, 4);
 
         assert_eq!(cpu.read_reg(3), 0x42);
-        assert_eq!(mem.load32(100), 0x42);
+        assert_eq!(mem.load32(100).unwrap(), 0x42);
     }
 
     #[test]
@@ -1099,7 +1210,6 @@ mod tests {
         // 测试 take_trap 方法的基本功能
         use crate::cpu::csr_def::*;
         
-        let mut mem = FlatMemory::new(1024, 0);
         let mut cpu = CpuBuilder::new(0x1000)
             .with_zicsr_extension()
             .build()

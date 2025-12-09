@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 elf = "0.7"
+simple-soft-float = "0.1"
